@@ -1,0 +1,61 @@
+{
+    "name": "i18n-definition-jump",
+    "displayName": "i18n Definition Jump",
+    "description": "支持Ctrl+Click点击$t()/t()/tt()中key，精准跳转到对应行，支持切换跳转目标语言",
+    "version": "1.0.1",
+    "publisher": "yeshen",
+    "icon": "icon.png",
+    "engines": {
+        "vscode": "^1.74.0"
+    },
+    "categories": [
+        "Programming Languages",
+        "Other"
+    ],
+    "keywords": [
+        "i18n",
+        "internationalization",
+        "locale",
+        "definition",
+        "jump",
+        "zh-CN",
+        "vue",
+        "$t"
+    ],
+    "activationEvents": [
+        "onLanguage:vue",
+        "onLanguage:typescript",
+        "onLanguage:javascript",
+        "onLanguage:typescriptreact",
+        "onLanguage:javascriptreact"
+    ],
+    "main": "./extension.js",
+    "contributes": {
+        "configuration": {
+            "title": "i18n Definition Jump",
+            "properties": {
+                "i18nDefinitionJump.localesPath": {
+                    "type": "string",
+                    "default": "src/i18n/locales",
+                    "description": "国际化语言包目录相对于工作区根目录的路径，如 src/i18n/locales"
+                },
+                "i18nDefinitionJump.targetLocale": {
+                    "type": "string",
+                    "default": "zh-CN",
+                    "description": "当前跳转的目标语言，对应 locales 目录下的文件夹名（如 zh-CN、en）"
+                }
+            }
+        },
+        "commands": [
+            {
+                "command": "i18nDefinitionJump.switchLocale",
+                "title": "i18n: 切换跳转目标语言"
+            }
+        ]
+    },
+    "repository": {
+        "type": "git",
+        "url": ""
+    },
+    "license": "MIT"
+}
