@@ -6,6 +6,12 @@ const path = require('path');
 const ALL_LOCALES = '*';
 
 /**
+ * 内存中的当前目标语言，切换时立即更新，不依赖配置文件异步落盘。
+ * 配置文件仅做持久化，下次启动时从配置读取初始值。
+ */
+let currentTargetLocale = '';
+
+/**
  * 将完整 key 拆分为 namespace（文件名）和 JSON 内部路径
  */
 function splitNamespaceAndKey(fullKey, localesDir) {
@@ -126,19 +132,18 @@ function buildTargetUri(filePath, line, character) {
 }
 
 /**
- * 读取插件配置，获取当前 locales 目录的绝对路径
+ * 获取 locales 相关路径信息，使用内存变量 currentTargetLocale 而非读配置
  */
-function getLocalesDir() {
+function getLocalesInfo() {
     const workspaceFolder = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
     if (!workspaceFolder) return null;
 
     const config = vscode.workspace.getConfiguration('i18nDefinitionJump');
     const localesPath = config.get('localesPath', 'src/i18n/locales');
-    const targetLocale = config.get('targetLocale', 'zh-CN');
 
     return {
-        localesDir: targetLocale === ALL_LOCALES ? null : path.join(workspaceFolder, localesPath, targetLocale),
-        targetLocale,
+        localesDir: currentTargetLocale === ALL_LOCALES ? null : path.join(workspaceFolder, localesPath, currentTargetLocale),
+        targetLocale: currentTargetLocale,
         localesRoot: path.join(workspaceFolder, localesPath),
     };
 }
@@ -164,6 +169,27 @@ function resolveKeyInLocale(key, localesDir, localeName) {
     return pos ? { filePath: result.filePath, pos, localeName } : null;
 }
 
+/**
+ * 收集所有语言包中某个 key 的跳转位置，返回纯数据（可安全序列化）
+ */
+function resolveKeyInAllLocalesData(key, localesRoot) {
+    const locales = scanAvailableLocales(localesRoot);
+    const results = [];
+
+    for (const locale of locales) {
+        const localeDir = path.join(localesRoot, locale);
+        const resolved = resolveKeyInLocale(key, localeDir, locale);
+        if (!resolved) continue;
+
+        results.push({
+            filePath: resolved.filePath,
+            line: resolved.pos.line,
+            character: resolved.pos.character,
+        });
+    }
+    return results;
+}
+
 /** 状态栏按钮，显示当前目标语言 */
 let statusBarItem;
 
@@ -172,6 +198,30 @@ function updateStatusBar(locale) {
         const label = locale === ALL_LOCALES ? '所有语言' : locale;
         statusBarItem.text = `$(globe) i18n: ${label}`;
         statusBarItem.tooltip = '点击切换 i18n 跳转目标语言';
+    }
+}
+
+/**
+ * 强制刷新所有打开的编辑器中的 DocumentLink：
+ * fire 事件后，对所有可见编辑器做一次无副作用的微编辑来强制 VSCode 立即重新请求链接
+ */
+async function forceRefreshLinks(linkChangeEmitter) {
+    linkChangeEmitter.fire();
+
+    for (const editor of vscode.window.visibleTextEditors) {
+        const doc = editor.document;
+        if (doc.uri.scheme !== 'file') continue;
+
+        // 插入空字符再撤销，强制触发 VSCode 重新请求 DocumentLink
+        const editApplied = await editor.edit(
+            (editBuilder) => {
+                editBuilder.insert(new vscode.Position(0, 0), ' ');
+            },
+            { undoStopBefore: false, undoStopAfter: false }
+        );
+        if (editApplied) {
+            await vscode.commands.executeCommand('undo');
+        }
     }
 }
 
@@ -184,20 +234,22 @@ function activate(context) {
         { language: 'javascriptreact', scheme: 'file' },
     ];
 
+    // 从配置读取初始值到内存
+    currentTargetLocale = vscode.workspace.getConfiguration('i18nDefinitionJump').get('targetLocale', 'zh-CN');
+
     /** 用于通知 VSCode 重新请求 DocumentLink 的事件发射器 */
     const linkChangeEmitter = new vscode.EventEmitter();
 
     // 状态栏显示当前目标语言，点击可切换
     statusBarItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 100);
     statusBarItem.command = 'i18nDefinitionJump.switchLocale';
-    const currentLocale = vscode.workspace.getConfiguration('i18nDefinitionJump').get('targetLocale', 'zh-CN');
-    updateStatusBar(currentLocale);
+    updateStatusBar(currentTargetLocale);
     statusBarItem.show();
     context.subscriptions.push(statusBarItem);
 
-    // 注册切换语言命令：扫描 locales 目录，弹出快速选择列表（含「所有语言」选项）
+    // 注册切换语言命令
     const switchLocaleCmd = vscode.commands.registerCommand('i18nDefinitionJump.switchLocale', async () => {
-        const info = getLocalesDir();
+        const info = getLocalesInfo();
         if (!info) {
             vscode.window.showWarningMessage('未检测到工作区');
             return;
@@ -212,12 +264,12 @@ function activate(context) {
         const items = [
             {
                 label: '$(globe) 所有语言',
-                description: info.targetLocale === ALL_LOCALES ? '(当前)' : '',
+                description: currentTargetLocale === ALL_LOCALES ? '(当前)' : '',
                 value: ALL_LOCALES,
             },
             ...locales.map((locale) => ({
                 label: locale,
-                description: locale === info.targetLocale ? '(当前)' : '',
+                description: locale === currentTargetLocale ? '(当前)' : '',
                 value: locale,
             })),
         ];
@@ -226,29 +278,65 @@ function activate(context) {
             placeHolder: '选择跳转的目标语言',
         });
 
-        if (picked) {
-            const config = vscode.workspace.getConfiguration('i18nDefinitionJump');
-            await config.update('targetLocale', picked.value, vscode.ConfigurationTarget.Workspace);
-            updateStatusBar(picked.value);
-            linkChangeEmitter.fire();
-            const label = picked.value === ALL_LOCALES ? '所有语言' : picked.value;
-            vscode.window.showInformationMessage(`i18n 跳转目标语言已切换为: ${label}`);
-        }
+        if (!picked || picked.value === currentTargetLocale) return;
+
+        // 1. 立即更新内存变量
+        currentTargetLocale = picked.value;
+        updateStatusBar(currentTargetLocale);
+
+        // 2. 强制刷新所有编辑器的链接
+        await forceRefreshLinks(linkChangeEmitter);
+
+        // 3. 异步持久化到配置文件
+        const config = vscode.workspace.getConfiguration('i18nDefinitionJump');
+        config.update('targetLocale', picked.value, vscode.ConfigurationTarget.Workspace);
+
+        const label = picked.value === ALL_LOCALES ? '所有语言' : picked.value;
+        vscode.window.showInformationMessage(`i18n 跳转目标语言已切换为: ${label}`);
     });
 
     /**
-     * DocumentLinkProvider：单语言模式下，在 i18n key 上生成可点击的链接直接跳转
-     * 「所有语言」模式下不生成 link，由 DefinitionProvider 接管
+     * 「所有语言」模式的 peek 命令：
+     * 接收纯数据参数，在命令内部重新构造 vscode.Location 对象，
+     * 然后调用 editor.action.peekLocations 展示 peek 视图
+     */
+    const peekAllLocalesCmd = vscode.commands.registerCommand(
+        'i18nDefinitionJump.peekAllLocales',
+        async (sourceUriStr, sourceLine, sourceChar, locationsData) => {
+            const editor = vscode.window.activeTextEditor;
+            if (!editor || !locationsData || locationsData.length === 0) return;
+
+            const sourcePosition = new vscode.Position(sourceLine, sourceChar);
+            const locations = locationsData.map((loc) =>
+                new vscode.Location(
+                    vscode.Uri.file(loc.filePath),
+                    new vscode.Position(loc.line, loc.character)
+                )
+            );
+
+            await vscode.commands.executeCommand(
+                'editor.action.peekLocations',
+                editor.document.uri,
+                sourcePosition,
+                locations,
+                'peek'
+            );
+        }
+    );
+
+    /**
+     * DocumentLinkProvider：
+     * - 单语言模式：直接生成 file URI 跳转链接
+     * - 所有语言模式：生成 command URI，Ctrl+Click 时触发 peek 命令
      */
     const linkProvider = vscode.languages.registerDocumentLinkProvider(
         supportedLanguages,
         {
             onDidChangeDocumentLinks: linkChangeEmitter.event,
             provideDocumentLinks(document) {
-                const info = getLocalesDir();
-                if (!info || info.targetLocale === ALL_LOCALES) return [];
+                const info = getLocalesInfo();
+                if (!info) return [];
 
-                const localesDir = info.localesDir;
                 const links = [];
 
                 for (let lineIdx = 0; lineIdx < document.lineCount; lineIdx++) {
@@ -256,16 +344,36 @@ function activate(context) {
                     const keys = extractAllKeysFromLine(lineText);
 
                     for (const { key, keyStart, keyEnd } of keys) {
-                        const resolved = resolveKeyInLocale(key, localesDir, info.targetLocale);
-                        if (!resolved) continue;
-
                         const range = new vscode.Range(lineIdx, keyStart, lineIdx, keyEnd);
-                        const targetUri = buildTargetUri(resolved.filePath, resolved.pos.line, resolved.pos.character);
 
-                        const link = new vscode.DocumentLink(range, targetUri);
-                        const fallbackHint = resolved.pos.fallback ? ' (回退匹配)' : '';
-                        link.tooltip = `跳转到 [${info.targetLocale}] ${path.basename(resolved.filePath)} (第${resolved.pos.line + 1}行)${fallbackHint}`;
-                        links.push(link);
+                        if (info.targetLocale === ALL_LOCALES) {
+                            const locationsData = resolveKeyInAllLocalesData(key, info.localesRoot);
+                            if (locationsData.length === 0) continue;
+
+                            // 传纯数据（字符串/数字），避免 VSCode 对象在序列化中丢失类型
+                            const args = [
+                                document.uri.toString(),
+                                lineIdx,
+                                keyStart,
+                                locationsData,
+                            ];
+                            const cmdUri = vscode.Uri.parse(
+                                `command:i18nDefinitionJump.peekAllLocales?${encodeURIComponent(JSON.stringify(args))}`
+                            );
+
+                            const link = new vscode.DocumentLink(range, cmdUri);
+                            link.tooltip = `查看所有语言包 (${locationsData.length} 个语言)`;
+                            links.push(link);
+                        } else {
+                            const resolved = resolveKeyInLocale(key, info.localesDir, info.targetLocale);
+                            if (!resolved) continue;
+
+                            const targetUri = buildTargetUri(resolved.filePath, resolved.pos.line, resolved.pos.character);
+                            const link = new vscode.DocumentLink(range, targetUri);
+                            const fallbackHint = resolved.pos.fallback ? ' (回退匹配)' : '';
+                            link.tooltip = `跳转到 [${info.targetLocale}] ${path.basename(resolved.filePath)} (第${resolved.pos.line + 1}行)${fallbackHint}`;
+                            links.push(link);
+                        }
                     }
                 }
                 return links;
@@ -273,56 +381,19 @@ function activate(context) {
         }
     );
 
-    /**
-     * DefinitionProvider：「所有语言」模式下，Ctrl+Click 返回所有语言包中的定位，
-     * VSCode 会以 peek 多结果视图展示
-     */
-    const defProvider = vscode.languages.registerDefinitionProvider(
-        supportedLanguages,
-        {
-            provideDefinition(document, position) {
-                const info = getLocalesDir();
-                if (!info || info.targetLocale !== ALL_LOCALES) return null;
-
-                const lineText = document.lineAt(position.line).text;
-                const keys = extractAllKeysFromLine(lineText);
-
-                const clickedKey = keys.find(
-                    (k) => position.character >= k.keyStart && position.character <= k.keyEnd
-                );
-                if (!clickedKey) return null;
-
-                const locales = scanAvailableLocales(info.localesRoot);
-                const locations = [];
-
-                for (const locale of locales) {
-                    const localeDir = path.join(info.localesRoot, locale);
-                    const resolved = resolveKeyInLocale(clickedKey.key, localeDir, locale);
-                    if (!resolved) continue;
-
-                    locations.push(
-                        new vscode.Location(
-                            vscode.Uri.file(resolved.filePath),
-                            new vscode.Position(resolved.pos.line, resolved.pos.character)
-                        )
-                    );
-                }
-
-                return locations;
-            },
-        }
-    );
-
-    // 配置变更时刷新状态栏并重新生成链接
+    // 外部修改配置时同步到内存
     const configWatcher = vscode.workspace.onDidChangeConfiguration((e) => {
         if (e.affectsConfiguration('i18nDefinitionJump.targetLocale')) {
-            const locale = vscode.workspace.getConfiguration('i18nDefinitionJump').get('targetLocale', 'zh-CN');
-            updateStatusBar(locale);
-            linkChangeEmitter.fire();
+            const newLocale = vscode.workspace.getConfiguration('i18nDefinitionJump').get('targetLocale', 'zh-CN');
+            if (newLocale !== currentTargetLocale) {
+                currentTargetLocale = newLocale;
+                updateStatusBar(currentTargetLocale);
+                linkChangeEmitter.fire();
+            }
         }
     });
 
-    context.subscriptions.push(switchLocaleCmd, linkProvider, defProvider, configWatcher, linkChangeEmitter);
+    context.subscriptions.push(switchLocaleCmd, peekAllLocalesCmd, linkProvider, configWatcher, linkChangeEmitter);
 }
 
 function deactivate() {}
