@@ -292,12 +292,20 @@ function activate(context) {
         config.update('targetLocale', picked.value, vscode.ConfigurationTarget.Workspace);
 
         const label = picked.value === ALL_LOCALES ? '所有语言' : picked.value;
-        vscode.window.showInformationMessage(`i18n 跳转目标语言已切换为: ${label}`);
+        // 用 withProgress 做 1.5 秒自动消失的提示
+        vscode.window.withProgress(
+            {
+                location: vscode.ProgressLocation.Notification,
+                title: `i18n 跳转目标语言已切换为: ${label}`,
+                cancellable: false,
+            },
+            () => new Promise((resolve) => setTimeout(resolve, 1500))
+        );
     });
 
     /**
      * 「所有语言」模式的 peek 命令：
-     * 接收纯数据参数，在命令内部重新构造 vscode.Location 对象，
+     * 接收纯数据参数，在命令内部重新构造 vscode.Location 对象（带 Range），
      * 然后调用 editor.action.peekLocations 展示 peek 视图
      */
     const peekAllLocalesCmd = vscode.commands.registerCommand(
@@ -307,6 +315,7 @@ function activate(context) {
             if (!editor || !locationsData || locationsData.length === 0) return;
 
             const sourcePosition = new vscode.Position(sourceLine, sourceChar);
+
             const locations = locationsData.map((loc) =>
                 new vscode.Location(
                     vscode.Uri.file(loc.filePath),
