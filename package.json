@@ -2,7 +2,7 @@
     "name": "i18n-definition-jump",
     "displayName": "i18n Definition Jump",
     "description": "支持Ctrl+Click点击$t()/t()/tt()中key，精准跳转到对应行，支持切换跳转目标语言",
-    "version": "1.0.1",
+    "version": "1.0.2",
     "publisher": "yeshen",
     "icon": "icon.png",
     "engines": {
