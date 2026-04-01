@@ -185,6 +185,7 @@ function resolveKeyInAllLocalesData(key, localesRoot) {
             filePath: resolved.filePath,
             line: resolved.pos.line,
             character: resolved.pos.character,
+            localeName: locale,
         });
     }
     return results;
@@ -323,6 +324,7 @@ function activate(context) {
                 )
             );
 
+            // 在源码文件上打开 peek 面板（不跳转）
             await vscode.commands.executeCommand(
                 'editor.action.peekLocations',
                 editor.document.uri,
@@ -330,6 +332,28 @@ function activate(context) {
                 locations,
                 'peek'
             );
+
+            // peek 面板默认按 URI 字母序展示，en-US 排在 zh-CN 前面
+            // 计算 zh-CN 在排序后列表中的位置，用 goToNextReference 导航过去
+            const sortedLocales = [...new Set(locationsData.map((l) => l.localeName))].sort();
+            const zhCnIndex = sortedLocales.indexOf('zh-CN');
+            if (zhCnIndex > 0) {
+                // 等待 peek 面板渲染完成
+                await new Promise((resolve) => setTimeout(resolve, 300));
+                // 为了确保按键对 peek 面板生效，可以先将焦点切给面板内的列表
+                await vscode.commands.executeCommand('togglePeekWidgetFocus');
+
+                // 向下移动光标到 zh-CN 的文件节点（此时还是折叠状态，如截图里的 >）
+                for (let i = 0; i < zhCnIndex; i++) {
+                    await vscode.commands.executeCommand('list.focusDown');
+                }
+                // 展开当前文件节点（将 > 变成 v）
+                await vscode.commands.executeCommand('list.expand');
+                // 再按一次向下，把光标从文件节点移动到里面的代码行，这样左边大窗才会刷新成中文内容
+                await vscode.commands.executeCommand('list.focusDown');
+                // 再将焦点切回左侧预览，体验更好
+                await vscode.commands.executeCommand('togglePeekWidgetFocus');
+            }
         }
     );
 
